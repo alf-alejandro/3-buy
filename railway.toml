@@ -4,24 +4,3 @@ builder = "nixpacks"
 [deploy]
 startCommand = "python basket_soft.py"
 ```
-
-> En Railway con un solo servicio, usa el `Procfile`. Si quieres dos servicios separados (bot + dashboard), crea dos servicios en Railway y en cada uno pon el start command manualmente.
-
-**Variables de entorno en Railway** — esto es lo más importante, el dashboard y el bot deben leer el mismo archivo:
-
-| Variable | Valor |
-|---|---|
-| `STATE_FILE` | `/data/basket_soft_state.json` |
-| `CSV_FILE` | `/data/basket_soft_trades.csv` |
-| `LOG_FILE` | `/data/basket_soft_log.json` |
-| `PORT` | `5000` |
-
----
-
-## Estructura recomendada en Railway (más simple)
-
-Ya que `basket_soft.py` lanza el dashboard en un hilo secundario, **un solo servicio** es suficiente:
-
-1. Renombra `Procfile.txt` → `Procfile` con este contenido:
-```
-web: python basket_soft.py
