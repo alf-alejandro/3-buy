@@ -2,28 +2,14 @@
 basket.py — Backtesting EN VIVO de Divergencia Armónica ETH/SOL/BTC
 Lee precios REALES del order book de Polymarket — SIN ejecutar órdenes reales.
 
-LOGICA BINARIA CORRECTA:
-  Los tokens de Polymarket resuelven en 0 o 1 (todo o nada).
-  Cada entrada cuesta exactamente $1.00 (el 1% del capital de $100).
-  Shares comprados = $1.00 / precio_ask
-
-CAMBIOS v4:
-  - ENTRY_WINDOW_SECS = 85 (era 90) → elimina franja 85-90s que era PnL negativo
-  - DIVERGENCE_THRESHOLD = 0.05 (era 0.04) → gap mínimo 5pts
-  - DIVERGENCE_MAX = 0.14 → gap máximo 14pts, descarta divergencias anómalas
-  Resultado histórico con estos 3 filtros: WR=80%, PF=2.44, MaxDD=$2.29
-
-CAMBIOS v5:
-  - ELIMINADO Gamma API — ya no se consulta fetch_market_resolution
-  - Resolución fallback: promedio de las últimas 3 muestras CLOB del activo
-  - Si up_mid_avg > 0.5 → UP, si < 0.5 → DOWN, si == 0.5 → LOSS conservador
-  - Cero bloqueos: resolución inmediata al expirar el mercado
-
 CAMBIOS v6:
   - Filtros granulares por combinación activo+lado (gap_pts y entry_mid)
-  - Basados en análisis histórico de 323 trades por combinación
+  - Basados en análisis histórico por combinación
   - Reemplaza DIVERGENCE_THRESHOLD/MAX y ENTRY_MIN_PRICE globales
-    por rangos específicos por activo/lado
+
+CAMBIOS v7:
+  - ELIMINADO stop loss — trades corren hasta resolución binaria (0 o 1)
+  - sl_price = 0.0 en CSV por compatibilidad con registros históricos
 """
 
 import asyncio
@@ -72,8 +58,7 @@ RESOLVED_DN_THRESH   = 0.02
 CONSENSUS_FULL       = 0.80
 CONSENSUS_SOFT       = 0.80
 
-STOP_LOSS_PRICE      = 0.33
-
+# Sin stop loss — trades corren hasta resolución binaria
 MID_HISTORY_SIZE     = 3
 
 LOG_FILE   = os.environ.get("LOG_FILE",   "/data/basket_log.json")
@@ -83,12 +68,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 # ═══════════════════════════════════════════════════════
 #  FILTROS GRANULARES POR ACTIVO + LADO  (v6)
 #
-#  gap_min / gap_max  → rango de gap_pts (valores NEGATIVOS, como vienen de signal_div*100)
-#  mid_min / mid_max  → rango del precio ask de entrada (entry_ask)
-#
-#  Nota: gap_pts se calcula como signal_div * 100 y es siempre negativo
-#  (el activo cotiza POR DEBAJO de la media armónica de sus pares).
-#  Por eso gap_min es el más negativo (límite izquierdo) y gap_max el menos negativo.
+#  gap_min / gap_max  → rango de gap_pts (negativos, como viene de signal_div*100)
+#  mid_min / mid_max  → rango del precio ask de entrada
 # ═══════════════════════════════════════════════════════
 ENTRY_CONDITIONS = {
     "SOL": {
@@ -480,7 +461,6 @@ def check_entry():
     sym  = bt["signal_asset"]
     side = bt["signal_side"]
 
-    # ── Obtener precio de entrada ──────────────────────
     if side == "UP":
         entry_ask = markets[sym]["up_ask"]
         entry_bid = markets[sym]["up_bid"]
@@ -493,7 +473,6 @@ def check_entry():
     if entry_ask <= 0 or entry_ask >= 1:
         return
 
-    # ── Guardia: activo ya resuelto ────────────────────
     up_mid = markets[sym]["up_mid"]
     dn_mid = markets[sym]["dn_mid"]
     if up_mid >= RESOLVED_UP_THRESH or up_mid <= RESOLVED_DN_THRESH or \
@@ -505,12 +484,11 @@ def check_entry():
     # ── Filtros granulares por activo + lado (v6) ──────
     cond = ENTRY_CONDITIONS.get(sym, {}).get(side)
     if cond is None:
-        # combinación no contemplada en la tabla → no operar
         log_event(f"SKIP {side} {sym} — combinación no definida en ENTRY_CONDITIONS")
         bt["skipped"] += 1
         return
 
-    gap_pts = bt["signal_div"] * 100  # signal_div es fracción, convertir a puntos
+    gap_pts = bt["signal_div"] * 100
 
     if not (cond["gap_min"] <= gap_pts <= cond["gap_max"]):
         log_event(
@@ -567,25 +545,6 @@ def check_entry():
         f"shares={shares:.4f} | capital=${bt['capital']:.2f}"
     )
     write_state()
-
-
-def check_stop_loss():
-    pos  = bt["position"]
-    if not pos:
-        return
-    sym  = pos["asset"]
-    side = pos["side"]
-    current_bid = markets[sym]["up_bid"] if side == "UP" else markets[sym]["dn_bid"]
-    if current_bid <= STOP_LOSS_PRICE and current_bid > 0:
-        pnl = round(pos["shares"] * current_bid - ENTRY_USD, 6)
-        bt["capital"]   += ENTRY_USD + pnl
-        bt["total_pnl"] += pnl
-        bt["losses"]    += 1
-        update_drawdown()
-        log_event(f"STOP LOSS {side} {sym} @ bid={current_bid:.4f} | PnL=${pnl:+.4f}")
-        _record_trade_sl(pos, current_bid, pnl)
-        bt["position"] = None
-        write_state()
 
 
 def _apply_resolution(pos, resolved):
@@ -670,7 +629,6 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
     p1_side_mid, p1_opp_mid = peer_mids(peers[0]) if len(peers) > 0 else (0.0, 0.0)
     p2_side_mid, p2_opp_mid = peer_mids(peers[1]) if len(peers) > 1 else (0.0, 0.0)
 
-    sl_price = STOP_LOSS_PRICE
     max_win  = round((1.0 - pos["entry_price"]) / pos["entry_price"] * pos["entry_usd"], 6)
 
     binary_win = 1 if outcome == "WIN" and exit_type == "RESOLUTION" else \
@@ -698,7 +656,7 @@ def _build_trade_record(pos, exit_type, exit_price, resolved, outcome, pnl):
         "peer2_sym":        peers[1] if len(peers) > 1 else "",
         "peer2_side_mid":   round(p2_side_mid, 6),
         "peer2_opp_mid":    round(p2_opp_mid, 6),
-        "sl_price":         sl_price,
+        "sl_price":         0.0,   # sin stop loss — campo mantenido por compatibilidad
         "exit_type":        exit_type,
         "exit_price":       round(exit_price, 6),
         "resolved":         resolved or "",
@@ -731,13 +689,6 @@ def _record_trade(pos, resolved, outcome, pnl):
     _save_log()
 
 
-def _record_trade_sl(pos, exit_bid, pnl):
-    record = _build_trade_record(pos, "STOP_LOSS", exit_bid, None, "LOSS", pnl)
-    bt["trades"].append(record)
-    _save_csv(record)
-    _save_log()
-
-
 def _save_log():
     total = bt["wins"] + bt["losses"]
     with open(LOG_FILE, "w") as f:
@@ -763,7 +714,7 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA v6 (filtros granulares por activo+lado)")
+    log_event("basket.py iniciado — SIMULACION BINARIA v7 (sin stop loss, filtros granulares)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
     log_event(f"Ventana entrada: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
 
@@ -805,12 +756,11 @@ async def main_loop():
             bt["entry_window"] = (
                 secs is not None and
                 secs <= ENTRY_WINDOW_SECS and
-                secs >= ENTRY_OPEN_SECS
-                and secs > ENTRY_CLOSE_SECS
+                secs >= ENTRY_OPEN_SECS and
+                secs > ENTRY_CLOSE_SECS
             )
 
-            if bt["position"]:
-                check_stop_loss()
+            # Sin stop loss — solo check de resolución
             if bt["position"]:
                 check_resolution()
 
@@ -856,9 +806,9 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 54)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v6")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v7")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f} ({ENTRY_PCT*100:.0f}%)")
-    log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
+    log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s  |  Sin stop loss")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 54)
     log.info(f"State -> {STATE_FILE} | Log -> {LOG_FILE}")
